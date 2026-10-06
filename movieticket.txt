@@ -1,0 +1,1035 @@
+package com.movieticket;
+
+import com.movieticket.enums.*;
+import com.movieticket.facade.BookingFacade;
+import com.movieticket.model.*;
+import com.movieticket.repository.DataRepository;
+import com.movieticket.service.BookingService;
+import com.movieticket.service.CatalogService;
+
+import java.time.LocalDateTime;
+import java.util.*;
+import java.util.concurrent.*;
+
+public class Main {
+    public static void main(String[] args) throws InterruptedException {
+        System.out.println("=========================================================");
+        System.out.println("   ENTERPRISE MOVIE TICKET BOOKING SYSTEM (JAVA 8)       ");
+        System.out.println("=========================================================\n");
+
+        DataRepository repository = new DataRepository();
+        BookingService bookingService = new BookingService(repository);
+        CatalogService catalogService = new CatalogService(repository);
+        BookingFacade bookingFacade = new BookingFacade(bookingService);
+
+        Movie movie = new Movie.MovieBuilder("M-101", "KGF-3", "Kannada", Genre.ACTION)
+                .duration(180)
+                .rating(4.9)
+                .director("Prashanth Neel")
+                .build();
+        repository.movies.put(movie.getId(), movie);
+
+        List<Seat> screenSeats = Arrays.asList(
+            new Seat("A1", 1, 1, SeatType.REGURAL, 200.0),
+            new Seat("A2", 1, 2, SeatType.REGURAL, 200.0),
+            new Seat("A3", 1, 3, SeatType.REGURAL, 350.0)
+        );
+
+        Screen screen = new Screen("SCR-1", "IMAX Screen 1", screenSeats);
+        Theatre theatre = new Theatre("TH-1", "PVR Cinemas", "Bengaluru", "Koramangala", Collections.singletonList(screen));
+        repository.theatres.put(theatre.getId(), theatre);
+
+        Show show = new Show("SH-501", movie, theatre, screen, LocalDateTime.now().plusHours(2), LocalDateTime.now().plusHours(5));
+        repository.shows.put(show.getId(), show);
+
+        int concurrentUserCount = 100;
+        for (int i = 1; i <= concurrentUserCount; i++) {
+            String userId = "USR-" + i;
+            Customer customer = new Customer(userId, "Customer_" + i, "user" + i + "@example.com", "98765432" + i, "password");
+            repository.users.put(userId, customer);
+        }
+
+        System.out.println("Target Show: " + show.getMovie().getTitle() + " at " + theatre.getName() + " (" + theatre.getCity() + ")");
+        System.out.println("Simulating " + concurrentUserCount + " concurrent users attempting to lock Seat 'A1' simultaneously...\n");
+
+        ExecutorService executorService = Executors.newFixedThreadPool(20);
+        CountDownLatch latch = new CountDownLatch(1);
+        List<Future<Optional<Booking>>> futures = new ArrayList<>();
+
+        for (int i = 1; i <= concurrentUserCount; i++) {
+            final String userId = "USR-" + i;
+            Callable<Optional<Booking>> task = () -> {
+                latch.await();
+                return bookingService.reserveSeats(userId, "SH-501", Collections.singletonList("A1"));
+            };
+            futures.add(executorService.submit(task));
+        }
+
+        latch.countDown();
+
+        List<Booking> successfulLocks = new ArrayList<>();
+        for (Future<Optional<Booking>> future : futures) {
+            try {
+                Optional<Booking> res = future.get();
+                res.ifPresent(successfulLocks::add);
+            } catch (ExecutionException e) {
+                e.printStackTrace();
+            }
+        }
+
+        executorService.shutdown();
+        executorService.awaitTermination(5, TimeUnit.SECONDS);
+
+        System.out.println("\n---------------- CONCURRENCY TEST SUMMARY ----------------");
+        System.out.println("Total Concurrent Requests: " + concurrentUserCount);
+        System.out.println("Successful Locks Granted: " + successfulLocks.size());
+        System.out.println("Waiting List Queue Size: " + show.getWaitingListQueue().size());
+        System.out.println("----------------------------------------------------------\n");
+
+        if (!successfulLocks.isEmpty()) {
+            Booking winningBooking = successfulLocks.get(0);
+            String winningUserId = winningBooking.getCustomer().getId();
+
+            System.out.println("Testing Facade + Decorator Workflow for Winning User [" + winningUserId + "]...");
+            
+            Optional<Ticket> ticketOpt = bookingFacade.bookMovieTicketWithAddons(
+                    winningUserId,
+                    "SH-501",
+                    Collections.singletonList("A1"),
+                    PaymentMethod.UPI,
+                    true,  // Add Popcorn
+                    true,  // Add 3D Glasses
+                    false  // Add Insurance
+            );
+
+            ticketOpt.ifPresent(ticket -> System.out.println("\nFINAL ISSUED E-TICKET:\n" + ticket));
+        }
+
+        catalogService.generateRevenueAndOccupancyReport();
+
+        if (!successfulLocks.isEmpty()) {
+            System.out.println("Testing Cancellation & Priority Alert Pipeline...");
+            String winningBookingId = successfulLocks.get(0).getBookingId();
+            bookingService.cancelBooking(winningBookingId);
+        }
+    }
+}
+package com.movieticket.decorator;
+
+public class BaseTicket implements TicketComponent {
+    private final String seatInfo;
+    private final double price;
+
+    public BaseTicket(String seatInfo, double price) {
+        this.seatInfo = seatInfo;
+        this.price = price;
+    }
+
+    @Override
+    public double getCost() {
+        return price;
+    }
+
+    @Override
+    public String getDescription() {
+        return "Base Seats " + seatInfo + " [₹" + price + "]";
+    }
+}
+package com.movieticket.decorator;
+
+public class CancellationInsuranceDecorator extends TicketDecorator {
+    public CancellationInsuranceDecorator(TicketComponent ticket) {
+        super(ticket);
+    }
+
+    @Override
+    public double getCost() {
+        return wrappedTicket.getCost() + 20.0;
+    }
+
+    @Override
+    public String getDescription() {
+        return wrappedTicket.getDescription() + " + Ticket Insurance [₹20]";
+    }
+}
+package com.movieticket.decorator;
+
+public class Glasses3DDecorator extends TicketDecorator {
+    public Glasses3DDecorator(TicketComponent ticket) {
+        super(ticket);
+    }
+
+    @Override
+    public double getCost() {
+        return wrappedTicket.getCost() + 30.0;
+    }
+
+    @Override
+    public String getDescription() {
+        return wrappedTicket.getDescription() + " + 3D Glasses Rental [₹30]";
+    }
+}
+package com.movieticket.decorator;
+
+public class PopcornComboDecorator extends TicketDecorator {
+    public PopcornComboDecorator(TicketComponent ticket) {
+        super(ticket);
+    }
+
+    @Override
+    public double getCost() {
+        return wrappedTicket.getCost() + 150.0;
+    }
+
+    @Override
+    public String getDescription() {
+        return wrappedTicket.getDescription() + " + Popcorn Combo [₹150]";
+    }
+}
+package com.movieticket.decorator;
+
+
+public interface TicketComponent {
+    double getCost();
+    String getDescription();
+}
+package com.movieticket.decorator;
+
+public abstract class TicketDecorator implements TicketComponent {
+    protected final TicketComponent wrappedTicket;
+
+    public TicketDecorator(TicketComponent ticket) {
+        this.wrappedTicket = ticket;
+    }
+}
+package com.movieticket.enums;
+
+public enum BookingStatus {
+	PENDING, CONFIRMED, CANCELLED
+
+}
+package com.movieticket.enums;
+
+public enum Genre {
+	ACTION,COMEDY,DRAMA,SC_FI,THIRILLER,ROMANTIC
+
+}
+package com.movieticket.enums;
+
+public enum PaymentMethod {
+	UPI,CREDIT_CARD, DEBIT_CARD, NET_BANKING,WALLET
+
+}
+package com.movieticket.enums;
+
+public enum PaymentStatus {
+	PENDING,SUCCESSFUL,FAILED,REFUND
+
+}
+package com.movieticket.enums;
+
+public enum SeatStatus {
+	AVAILABLE, LOCKED, BOOCKED
+
+}
+package com.movieticket.enums;
+
+public enum SeatType {
+	REGURAL, PRIMIUM,VIP
+
+}
+package com.movieticket.enums;
+
+public enum UserRole {
+	CUSTOMER,ADMIN
+	
+
+}
+package com.movieticket.facade;
+
+import com.movieticket.decorator.*;
+import com.movieticket.enums.PaymentMethod;
+import com.movieticket.model.Booking;
+import com.movieticket.model.Ticket;
+import com.movieticket.service.BookingService;
+
+import java.util.Collections;
+import java.util.List;
+import java.util.Optional;
+
+public class BookingFacade {
+    private final BookingService bookingService;
+
+    public BookingFacade(BookingService bookingService) {
+        this.bookingService = bookingService;
+    }
+    
+    /*Optional<Ticket> ticketOpt = bookingFacade.bookMovieTicketWithAddons(
+                    winningUserId,
+                    "SH-501",
+                    Collections.singletonList("A1"),
+                    PaymentMethod.UPI,
+                    true,  // Add Popcorn
+                    true,  // Add 3D Glasses
+                    false  // Add Insurance
+            );
+*/
+
+    public Optional<Ticket> bookMovieTicketWithAddons(
+            String userId,
+            String showId,
+            List<String> seatIds,
+            PaymentMethod paymentMethod,
+            boolean addPopcorn,
+            boolean addGlasses,
+            boolean addInsurance) {
+
+        System.out.println("\n[FACADE] Orchestrating Ticket Reservation Workflow...");
+
+        Optional<Booking> bookingOpt = bookingService.reserveSeats(userId, showId, seatIds);
+        if (!bookingOpt.isPresent()) {
+            return Optional.empty();
+        }
+
+        Booking booking = bookingOpt.get();
+
+        TicketComponent itemizedBill = new BaseTicket(seatIds.toString(), booking.getTotalAmount());
+        if (addPopcorn) {
+            itemizedBill = new PopcornComboDecorator(itemizedBill);
+        }
+        if (addGlasses) {
+            itemizedBill = new Glasses3DDecorator(itemizedBill);
+        }
+        if (addInsurance) {
+            itemizedBill = new CancellationInsuranceDecorator(itemizedBill);
+        }
+
+        booking.setTotalAmount(itemizedBill.getCost());
+
+        System.out.println("[FACADE] Itemized Bill: " + itemizedBill.getDescription());
+        System.out.println("[FACADE] Final Price (Seats + Addons): ₹" + itemizedBill.getCost());
+
+        return bookingService.confirmBooking(booking.getBookingId(), paymentMethod);
+    }
+}
+package com.movieticket.model;
+
+import java.util.Arrays;
+import java.util.List;
+
+import com.movieticket.enums.UserRole;
+
+public class Admin extends User{
+	private final List<String>permissions;
+
+	public Admin(String id, String name, String email, String phone, String password) {
+		super(id, name, email, phone, password, UserRole.ADMIN);
+		this.permissions = Arrays.asList("MANAGE_MOVIES","VIEW_REPORTS");
+	}
+
+	public boolean hasPermissions(String permissions) {
+		return permissions.contains(permissions);
+	}
+	
+	 
+
+}
+package com.movieticket.model;
+
+import com.movieticket.enums.BookingStatus;
+import java.util.List;
+
+public class Booking {
+    private final String bookingId;
+    private final Customer customer;
+    private final Show show;
+    private final List<ShowSeat> bookedSeats;
+    private double totalAmount;
+    private BookingStatus status;
+    private Ticket ticket;
+    private Payment payment;
+
+    public Booking(String bookingId, Customer customer, Show show, List<ShowSeat> bookedSeats, double totalAmount) {
+        this.bookingId = bookingId;
+        this.customer = customer;
+        this.show = show;
+        this.bookedSeats = bookedSeats;
+        this.totalAmount = totalAmount;
+        this.status = BookingStatus.PENDING;
+    }
+
+    public String getBookingId() { return bookingId; }
+    public Customer getCustomer() { return customer; }
+    public Show getShow() { return show; }
+    public List<ShowSeat> getBookedSeats() { return bookedSeats; }
+    public double getTotalAmount() { return totalAmount; }
+    public void setTotalAmount(double totalAmount) { this.totalAmount = totalAmount; }
+    public BookingStatus getStatus() { return status; }
+    public void setStatus(BookingStatus status) { this.status = status; }
+    public void setTicket(Ticket ticket) { this.ticket = ticket; }
+    public void setPayment(Payment payment) { this.payment = payment; }
+}
+package com.movieticket.model;
+
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
+
+import com.movieticket.enums.UserRole;
+
+public class Customer extends User {
+	private final List<Booking>bookingHistory;
+	
+	public Customer(String id, String name,String email, String phone, String password) {
+		super (id,name,email, phone, password, UserRole.CUSTOMER);
+		this.bookingHistory=new CopyOnWriteArrayList<>();
+	}
+	public List<Booking>getBookings(){
+		return bookingHistory;
+	}
+	public void addBooking(Booking booking) {
+		this.bookingHistory.add(booking);
+	}
+
+}
+package com.movieticket.model;
+
+import com.movieticket.enums.Genre;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.List;
+
+public class Movie {
+    private final String id;
+    private final String title;
+    private final String language;
+    private final Genre genre;
+    private final int durationInMinutes;
+    private final double rating;
+    private final LocalDateTime releaseDate;
+    private final String director;
+
+    private Movie(MovieBuilder builder) {
+        this.id = builder.id;
+        this.title = builder.title;
+        this.language = builder.language;
+        this.genre = builder.genre;
+        this.durationInMinutes = builder.durationInMinutes;
+        this.rating = builder.rating;
+        this.releaseDate = builder.releaseDate;
+        this.director = builder.director;
+    }
+
+    public String getId() { return id; }
+    public String getTitle() { return title; }
+    public String getLanguage() { return language; }
+    public Genre getGenre() { return genre; }
+    public double getRating() { return rating; }
+
+    public static class MovieBuilder {
+        private final String id;
+        private final String title;
+        private final String language;
+        private final Genre genre;
+        private int durationInMinutes = 120;
+        private double rating = 0.0;
+        private LocalDateTime releaseDate = LocalDateTime.now();
+        private String director = "Unknown";
+
+        public MovieBuilder(String id, String title, String language, Genre genre) {
+            this.id = id;
+            this.title = title;
+            this.language = language;
+            this.genre = genre;
+        }
+
+        public MovieBuilder duration(int durationInMinutes) {
+            this.durationInMinutes = durationInMinutes;
+            return this;
+        }
+
+        public MovieBuilder rating(double rating) {
+            this.rating = rating;
+            return this;
+        }
+
+        public MovieBuilder releaseDate(LocalDateTime releaseDate) {
+            this.releaseDate = releaseDate;
+            return this;
+        }
+
+        public MovieBuilder director(String director) {
+            this.director = director;
+            return this;
+        }
+
+        public Movie build() {
+            return new Movie(this);
+        }
+    }
+}
+package com.movieticket.model;
+
+import com.movieticket.enums.PaymentMethod;
+import com.movieticket.enums.PaymentStatus;
+
+public class Payment {
+    private final String paymentId;
+    private final String bookingId;
+    private final double amount;
+    private final PaymentMethod method;
+    private PaymentStatus status;
+
+    public Payment(String paymentId, String bookingId, double amount, PaymentMethod method) {
+        this.paymentId = paymentId;
+        this.bookingId = bookingId;
+        this.amount = amount;
+        this.method = method;
+        this.status = PaymentStatus.PENDING;
+    }
+
+    public PaymentStatus getStatus() { return status; }
+    public void setStatus(PaymentStatus status) { this.status = status; }
+}
+package com.movieticket.model;
+
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+public class Screen {
+    private final String id;
+    private final String name;
+    private final Map<String, Seat> seats;
+
+    public Screen(String id, String name, List<Seat> seatList) {
+        this.id = id;
+        this.name = name;
+        this.seats = new ConcurrentHashMap<>();
+        seatList.forEach(seat -> this.seats.put(seat.getSeatId(), seat));
+    }
+
+    public String getId() { return id; }
+    public String getName() { return name; }
+    public Map<String, Seat> getSeats() { return seats; }
+}
+package com.movieticket.model;
+
+import com.movieticket.enums.SeatType;
+
+public class Seat {
+    private final String seatId;
+    private final int row;
+    private final int column;
+    private final SeatType seatType;
+    private final double price;
+
+    public Seat(String seatId, int row, int column, SeatType seatType, double price) {
+        this.seatId = seatId;
+        this.row = row;
+        this.column = column;
+        this.seatType = seatType;
+        this.price = price;
+    }
+
+    public String getSeatId() { return seatId; }
+    public SeatType getSeatType() { return seatType; }
+    public double getPrice() { return price; }
+}
+package com.movieticket.model;
+
+import java.time.LocalDateTime;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.locks.ReentrantLock;
+
+public class Show {
+    private final String id;
+    private final Movie movie;
+    private final Theatre theatre;
+    private final Screen screen;
+    private final LocalDateTime startTime;
+    private final LocalDateTime endTime;
+    private final Map<String, ShowSeat> showSeats;
+    private final ConcurrentLinkedQueue<String> waitingListQueue;
+    private final ReentrantLock showLock;
+
+    public Show(String id, Movie movie, Theatre theatre, Screen screen, LocalDateTime startTime, LocalDateTime endTime) {
+        this.id = id;
+        this.movie = movie;
+        this.theatre = theatre;
+        this.screen = screen;
+        this.startTime = startTime;
+        this.endTime = endTime;
+        this.waitingListQueue = new ConcurrentLinkedQueue<>();
+        this.showLock = new ReentrantLock();
+
+        this.showSeats = new ConcurrentHashMap<>();
+        screen.getSeats().forEach((seatId, seat) ->
+            this.showSeats.put(seatId, new ShowSeat(seat.getSeatId(), seat.getSeatType(), seat.getPrice()))
+        );
+    }
+
+    public String getId() { return id; }
+    public Movie getMovie() { return movie; }
+    public Theatre getTheatre() { return theatre; }
+    public LocalDateTime getStartTime() { return startTime; }
+    public Map<String, ShowSeat> getShowSeats() { return showSeats; }
+    public ConcurrentLinkedQueue<String> getWaitingListQueue() { return waitingListQueue; }
+    public ReentrantLock getShowLock() { return showLock; }
+}
+package com.movieticket.model;
+
+import com.movieticket.enums.SeatStatus;
+import com.movieticket.enums.SeatType;
+import java.time.Duration;
+import java.time.LocalDateTime;
+
+public class ShowSeat {
+    private final String seatId;
+    private final SeatType seatType;
+    private final double price;
+    private SeatStatus status;
+    private String lockedByUserId;
+    private LocalDateTime lockTimestamp;
+
+    public ShowSeat(String seatId, SeatType seatType, double price) {
+        this.seatId = seatId;
+        this.seatType = seatType;
+        this.price = price;
+        this.status = SeatStatus.AVAILABLE;
+    }
+
+    public String getSeatId() { return seatId; }
+    public double getPrice() { return price; }
+    public SeatStatus getStatus() { return status; }
+
+    public boolean isLockExpired(int lockTimeoutMinutes) {
+        if (status != SeatStatus.LOCKED || lockTimestamp == null) return false;
+        return Duration.between(lockTimestamp, LocalDateTime.now()).toMinutes() >= lockTimeoutMinutes;
+    }
+
+    public void lockSeat(String userId) {
+        this.status = SeatStatus.LOCKED;
+        this.lockedByUserId = userId;
+        this.lockTimestamp = LocalDateTime.now();
+    }
+
+    public void releaseLock() {
+        this.status = SeatStatus.AVAILABLE;
+        this.lockedByUserId = null;
+        this.lockTimestamp = null;
+    }
+
+    public void setStatus(SeatStatus status) {
+        this.status = status;
+    }
+}
+package com.movieticket.model;
+
+import java.util.List;
+
+public class Theatre {
+    private final String id;
+    private final String name;
+    private final String city;
+    private final String location;
+    private final List<Screen> screens;
+
+    public Theatre(String id, String name, String city, String location, List<Screen> screens) {
+        this.id = id;
+        this.name = name;
+        this.city = city;
+        this.location = location;
+        this.screens = screens;
+    }
+
+    public String getId() { return id; }
+    public String getName() { return name; }
+    public String getCity() { return city; }
+    public String getLocation() { return location; }
+    public List<Screen> getScreens() { return screens; }
+}
+package com.movieticket.model;
+
+import java.time.LocalDateTime;
+import java.util.List;
+
+public class Ticket {
+    private final String ticketId;
+    private final String bookingId;
+    private final String movieTitle;
+    private final String theatreName;
+    private final List<String> seatIds;
+    private final LocalDateTime showTime;
+
+    public Ticket(String ticketId, String bookingId, String movieTitle, String theatreName, List<String> seatIds, LocalDateTime showTime) {
+        this.ticketId = ticketId;
+        this.bookingId = bookingId;
+        this.movieTitle = movieTitle;
+        this.theatreName = theatreName;
+        this.seatIds = seatIds;
+        this.showTime = showTime;
+    }
+
+    public String getTicketId() { return ticketId; }
+
+    @Override
+    public String toString() {
+        return "E-TICKET [TicketID=" + ticketId + ", BookingID=" + bookingId + ", Movie=" + movieTitle +
+               ", Theatre=" + theatreName + ", Seats=" + seatIds + ", ShowTime=" + showTime + "]";
+    }
+}
+package com.movieticket.model;
+
+import com.movieticket.enums.UserRole;
+
+public abstract class User {
+	protected final String id;
+	protected final String name;
+	protected final String email;
+	protected final String phone;
+	protected final String passwordHash;
+	protected final UserRole role;
+	public User(String id, String name, String email,String phone, String passwordHash, UserRole role) {
+		super();
+		this.id = id;
+		this.name = name;
+		this.email = email;
+		this.phone=phone;
+		this.passwordHash = passwordHash;
+		this.role = role;
+	
+	
+	}
+	public String getId() {
+		return id;
+	}
+	public String getName() {
+		return name;
+	}
+	public String getEmail() {
+		return email;
+	}
+	public String getPhone() {
+		return phone;
+	}
+	public boolean validatePassword(String password) {
+		return this.passwordHash.equals(password);
+	}}
+package com.movieticket.notification;
+
+import com.movieticket.model.User;
+
+public class EmailNotificationService implements NotificationService {
+    @Override
+    public void sendNotification(User user, String message) {
+        System.out.println("[EMAIL -> " + user.getEmail() + "]: " + message);
+    }
+}
+package com.movieticket.notification;
+
+import com.movieticket.model.User;
+
+public interface NotificationService {
+    void sendNotification(User user, String message);
+}
+package com.movieticket.notification;
+
+import com.movieticket.model.User;
+
+public class SMSNotificationService implements NotificationService {
+    @Override
+    public void sendNotification(User user, String message) {
+        System.out.println("[SMS ALERT -> " + user.getPhone() + "]: " + message);
+    }
+}
+package com.movieticket.repository;
+
+import com.movieticket.model.*;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+public class DataRepository {
+    public final Map<String, User> users = new ConcurrentHashMap<>();
+    public final Map<String, Movie> movies = new ConcurrentHashMap<>();
+    public final Map<String, Theatre> theatres = new ConcurrentHashMap<>();
+    public final Map<String, Show> shows = new ConcurrentHashMap<>();
+    public final Map<String, Booking> bookings = new ConcurrentHashMap<>();
+}
+package com.movieticket.service;
+
+import com.movieticket.enums.*;
+import com.movieticket.model.*;
+import com.movieticket.notification.*;
+import com.movieticket.repository.DataRepository;
+import com.movieticket.strategy.*;
+
+import java.time.LocalDateTime;
+import java.util.*;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.stream.Collectors;
+
+public class BookingService {
+    private final DataRepository repository;
+    private final NotificationService emailNotifier;
+    private final NotificationService smsNotifier;
+    private static final int LOCK_TIMEOUT_MINUTES = 5;
+
+    public BookingService(DataRepository repository) {
+        this.repository = repository;
+        this.emailNotifier = new EmailNotificationService();
+        this.smsNotifier = new SMSNotificationService();
+    }
+
+    public Optional<Booking> reserveSeats(String userId, String showId, List<String> seatIds) {
+        User user = repository.users.get(userId);
+        Show show = repository.shows.get(showId);
+
+        if (user == null || !(user instanceof Customer) || show == null) {
+            System.out.println("Booking Refused: User must be an authenticated Customer and Show must exist.");
+            return Optional.empty();
+        }
+
+        ReentrantLock showLock = show.getShowLock();
+        showLock.lock();
+        try {
+            Map<String, ShowSeat> showSeats = show.getShowSeats();
+
+            showSeats.values().stream()
+                     .filter(seat -> seat.isLockExpired(LOCK_TIMEOUT_MINUTES))
+                     .forEach(ShowSeat::releaseLock);
+
+            boolean allAvailable = seatIds.stream().allMatch(seatId -> {
+                ShowSeat seat = showSeats.get(seatId);
+                return seat != null && seat.getStatus() == SeatStatus.AVAILABLE;
+            });
+
+            if (!allAvailable) {
+                System.out.println("Lock Failed for User [" + user.getName() + "]: Requested seat(s) " + seatIds + " ALREADY LOCKED/BOOKED.");
+                show.getWaitingListQueue().add(userId);
+                System.out.println("-> Customer [" + user.getName() + "] enqueued into Waiting List for Show: " + showId);
+                return Optional.empty();
+            }
+
+            List<ShowSeat> reservedSeats = new ArrayList<>();
+            for (String seatId : seatIds) {
+                ShowSeat seat = showSeats.get(seatId);
+                seat.lockSeat(userId);
+                reservedSeats.add(seat);
+            }
+
+            double totalAmount = reservedSeats.stream().mapToDouble(ShowSeat::getPrice).sum();
+            String bookingId = "BK-" + UUID.randomUUID().toString().substring(0, 8);
+
+            Booking booking = new Booking(bookingId, (Customer) user, show, reservedSeats, totalAmount);
+            repository.bookings.put(bookingId, booking);
+            ((Customer) user).addBooking(booking);
+
+            System.out.println("SUCCESS: Seats " + seatIds + " locked for 5 mins for User [" + user.getName() + "]. Booking ID: " + bookingId);
+            return Optional.of(booking);
+
+        } finally {
+            showLock.unlock();
+        }
+    }
+
+    public Optional<Ticket> confirmBooking(String bookingId, PaymentMethod paymentMethod) {
+        Booking booking = repository.bookings.get(bookingId);
+        if (booking == null || booking.getStatus() != BookingStatus.PENDING) {
+            System.out.println("Confirmation Failed: Invalid or non-pending booking.");
+            return Optional.empty();
+        }
+
+        PaymentStrategy paymentStrategy = PaymentStrategyFactory.getStrategy(paymentMethod);
+        boolean paymentSuccess = paymentStrategy.processPayment(bookingId, booking.getTotalAmount());
+
+        ReentrantLock showLock = booking.getShow().getShowLock();
+        showLock.lock();
+        try {
+            if (paymentSuccess) {
+                booking.setStatus(BookingStatus.CONFIRMED);
+                booking.getBookedSeats().forEach(seat -> seat.setStatus(SeatStatus.BOOCKED));
+
+                Payment payment = new Payment("PAY-" + UUID.randomUUID().toString().substring(0, 8), bookingId, booking.getTotalAmount(), paymentMethod);
+                payment.setStatus(PaymentStatus.SUCCESSFUL);
+                booking.setPayment(payment);
+
+                String ticketId = "TCK-" + UUID.randomUUID().toString().substring(0, 8);
+                List<String> seatIds = booking.getBookedSeats().stream().map(ShowSeat::getSeatId).collect(Collectors.toList());
+
+                Ticket ticket = new Ticket(ticketId, bookingId, booking.getShow().getMovie().getTitle(),
+                        booking.getShow().getTheatre().getName(), seatIds, booking.getShow().getStartTime());
+
+                booking.setTicket(ticket);
+
+                String msg = "Booking Confirmed! Ticket ID: " + ticketId + " for Movie: " + booking.getShow().getMovie().getTitle();
+                emailNotifier.sendNotification(booking.getCustomer(), msg);
+                smsNotifier.sendNotification(booking.getCustomer(), msg);
+
+                return Optional.of(ticket);
+            } else {
+                booking.setStatus(BookingStatus.CANCELLED);
+                booking.getBookedSeats().forEach(ShowSeat::releaseLock);
+                System.out.println("Payment Failed. Seat locks released for Booking ID: " + bookingId);
+                return Optional.empty();
+            }
+        } finally {
+            showLock.unlock();
+        }
+    }
+
+    public boolean cancelBooking(String bookingId) {
+        Booking booking = repository.bookings.get(bookingId);
+        if (booking == null || booking.getStatus() != BookingStatus.CONFIRMED) {
+            System.out.println("Cancellation Failed: Booking not found or not confirmed.");
+            return false;
+        }
+
+        if (LocalDateTime.now().isAfter(booking.getShow().getStartTime())) {
+            System.out.println("Cancellation Failed: Show has already started/completed.");
+            return false;
+        }
+
+        ReentrantLock showLock = booking.getShow().getShowLock();
+        showLock.lock();
+        try {
+            booking.setStatus(BookingStatus.CANCELLED);
+            booking.getBookedSeats().forEach(ShowSeat::releaseLock);
+
+            PaymentStrategy paymentStrategy = PaymentStrategyFactory.getStrategy(PaymentMethod.UPI);
+            paymentStrategy.processRefund(bookingId, booking.getTotalAmount());
+
+            System.out.println("SUCCESS: Booking " + bookingId + " cancelled and seats released.");
+
+            ConcurrentLinkedQueue<String> queue = booking.getShow().getWaitingListQueue();
+            if (!queue.isEmpty()) {
+                String nextUserId = queue.poll();
+                User nextUser = repository.users.get(nextUserId);
+                if (nextUser != null) {
+                    emailNotifier.sendNotification(nextUser, "PRIORITY ALERT: Seats released for Show: "
+                            + booking.getShow().getMovie().getTitle() + "! Book now.");
+                }
+            }
+            return true;
+        } finally {
+            showLock.unlock();
+        }
+    }
+}
+package com.movieticket.service;
+
+import com.movieticket.enums.BookingStatus;
+import com.movieticket.enums.Genre;
+import com.movieticket.model.Booking;
+import com.movieticket.model.Movie;
+import com.movieticket.model.Theatre;
+import com.movieticket.repository.DataRepository;
+
+import java.util.List;
+import java.util.stream.Collectors;
+
+public class CatalogService {
+    private final DataRepository repository;
+
+    public CatalogService(DataRepository repository) {
+        this.repository = repository;
+    }
+
+    public List<Movie> searchMovies(String title, Genre genre, String language) {
+        return repository.movies.values().stream()
+                .filter(m -> title == null || m.getTitle().equalsIgnoreCase(title))
+                .filter(m -> genre == null || m.getGenre() == genre)
+                .filter(m -> language == null || m.getLanguage().equalsIgnoreCase(language))
+                .collect(Collectors.toList());
+    }
+
+    public List<Theatre> searchTheatresByCity(String city) {
+        return repository.theatres.values().stream()
+                .filter(t -> t.getCity().equalsIgnoreCase(city))
+                .collect(Collectors.toList());
+    }
+
+    public void generateRevenueAndOccupancyReport() {
+        System.out.println("\n========================================================");
+        System.out.println("        ADMINISTRATIVE REVENUE & OCCUPANCY REPORT       ");
+        System.out.println("========================================================");
+
+        double totalRevenue = repository.bookings.values().stream()
+                .filter(b -> b.getStatus() == BookingStatus.CONFIRMED)
+                .mapToDouble(Booking::getTotalAmount)
+                .sum();
+
+        long confirmedCount = repository.bookings.values().stream()
+                .filter(b -> b.getStatus() == BookingStatus.CONFIRMED)
+                .count();
+
+        System.out.println("Total Confirmed Bookings: " + confirmedCount);
+        System.out.println("Total System Revenue Realized: ₹" + totalRevenue);
+        System.out.println("========================================================\n");
+    }
+}
+package com.movieticket.strategy;
+
+public class CardPaymentStrategy implements PaymentStrategy {
+    @Override
+    public boolean processPayment(String bookingId, double amount) {
+        System.out.println("[CARD GATEWAY] Processed payment of ₹" + amount + " for Booking: " + bookingId);
+        return true;
+    }
+    @Override
+    public boolean processRefund(String bookingId, double amount) {
+        System.out.println("[CARD GATEWAY] Processed refund of ₹" + amount + " for Booking: " + bookingId);
+        return true;
+    }
+}
+package com.movieticket.strategy;
+
+public class NetBankingPaymentStrategy implements PaymentStrategy {
+    @Override
+    public boolean processPayment(String bookingId, double amount) {
+        System.out.println("[NETBANKING GATEWAY] Processed payment of ₹" + amount + " for Booking: " + bookingId);
+        return true;
+    }
+    @Override
+    public boolean processRefund(String bookingId, double amount) {
+        System.out.println("[NETBANKING GATEWAY] Processed refund of ₹" + amount + " for Booking: " + bookingId);
+        return true;
+    }
+}
+package com.movieticket.strategy;
+
+public interface PaymentStrategy {
+    boolean processPayment(String bookingId, double amount);
+    boolean processRefund(String bookingId, double amount);
+}
+package com.movieticket.strategy;
+
+import com.movieticket.enums.PaymentMethod;
+
+public class PaymentStrategyFactory {
+    public static PaymentStrategy getStrategy(PaymentMethod method) {
+        switch (method) {
+            case UPI: return new UPIPaymentStrategy();
+            case CREDIT_CARD:
+            case DEBIT_CARD: return new CardPaymentStrategy();
+            case NET_BANKING: return new NetBankingPaymentStrategy();
+            default: return new UPIPaymentStrategy();
+        }
+    }
+}
+package com.movieticket.strategy;
+
+public class UPIPaymentStrategy implements PaymentStrategy {
+    @Override
+    public boolean processPayment(String bookingId, double amount) {
+        System.out.println("[UPI GATEWAY] Processed payment of ₹" + amount + " for Booking: " + bookingId);
+        return true;
+    }
+    @Override
+    public boolean processRefund(String bookingId, double amount) {
+        System.out.println("[UPI GATEWAY] Processed refund of ₹" + amount + " for Booking: " + bookingId);
+        return true;
+    }
+}
